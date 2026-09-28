@@ -18,6 +18,12 @@ const envSchema = z.object({
   ETHEREAL_FROM: z.string().default('ReachInbox <no-reply@ethereal.email>'),
   WORKER_CONCURRENCY: z.coerce.number().default(5),
   MAX_ATTEMPTS: z.coerce.number().default(3),
+  MIN_SEND_DELAY_MS: z.coerce.number().default(2000),
+  ELASTICSEARCH_URL: z.string().default('http://localhost:9200'),
+  ELASTICSEARCH_INDEX: z.string().default('reachinbox-emails'),
+  SLACK_CLIENT_ID: z.string().optional(),
+  SLACK_CLIENT_SECRET: z.string().optional(),
+  SLACK_REDIRECT_URI: z.string().default('http://localhost:4000/api/slack/callback'),
 });
 
 export type Env = z.infer<typeof envSchema>;
@@ -30,6 +36,10 @@ export function isGoogleOAuthConfigured(): boolean {
 
 export function isEtherealConfigured(): boolean {
   return Boolean(env.ETHEREAL_USER && env.ETHEREAL_PASSWORD);
+}
+
+export function isSlackConfigured(): boolean {
+  return Boolean(env.SLACK_CLIENT_ID && env.SLACK_CLIENT_SECRET);
 }
 
 export function assertProductionSecrets(): void {

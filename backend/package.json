@@ -18,6 +18,9 @@
     "db:check": "tsx src/scripts/db-check.ts"
   },
   "dependencies": {
+    "@bull-board/api": "^6.21.3",
+    "@bull-board/express": "^6.21.3",
+    "@elastic/elasticsearch": "^8.19.2",
     "@prisma/client": "^6.19.3",
     "bullmq": "^5.81.5",
     "connect-pg-simple": "^10.0.0",

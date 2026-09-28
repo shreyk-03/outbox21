@@ -10,6 +10,9 @@ const app = createApp();
 const agent = request(app);
 const TAG = `phase4-api-${Date.now()}`;
 
+// Isolated Redis queue: parallel test files must never share jobs.
+process.env.EMAIL_QUEUE_NAME = `email-send-${TAG}`;
+
 let userA: TestIdentity;
 let userB: TestIdentity;
 const jobIds: string[] = [];
@@ -28,6 +31,7 @@ afterAll(async () => {
   for (const jobId of jobIds) {
     await getEmailQueue().getJob(jobId).then((j) => j?.remove()).catch(() => undefined);
   }
+  await getEmailQueue().obliterate({ force: true }).catch(() => undefined);
   await closeEmailQueue();
   await cleanupTestData(TAG);
   await prisma.$disconnect();
@@ -94,7 +98,7 @@ describe('POST /api/emails/schedule', () => {
     expect(res.status).toBe(201);
     expect(res.body).toMatchObject({ status: 'SCHEDULED', recipient: 'future@example.com' });
     expect(res.body.id).toBeTruthy();
-    expect(res.body.bullmqJobId).toBe(emailJobId(res.body.id));
+    expect(res.body.bullmqJobId).toBe(emailJobId(res.body.id, new Date(res.body.scheduledAt).getTime()));
     expect(res.body.delayMs).toBeGreaterThan(0);
     jobIds.push(res.body.bullmqJobId);
 
@@ -104,7 +108,7 @@ describe('POST /api/emails/schedule', () => {
 
     const job = await getEmailQueue().getJob(res.body.bullmqJobId);
     expect(job).toBeTruthy();
-    expect(job?.data).toEqual({ emailId: res.body.id });
+    expect(job?.data).toEqual({ emailId: res.body.id, slotMs: new Date(res.body.scheduledAt).getTime() });
     expect(job?.opts.delay).toBeGreaterThan(0);
   });
 

@@ -121,6 +121,8 @@ model SlackConnection {
   accessToken String   @db.Text
   teamId      String?
   teamName    String?
+  // Slack user id from auth.test — DM target for rate-limit alerts.
+  slackUserId String?
   createdAt   DateTime @default(now())
   updatedAt   DateTime @updatedAt
 }

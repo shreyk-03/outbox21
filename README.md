@@ -1,6 +1,6 @@
 # ReachInbox Email Scheduler
 
-> Phase 3: real Google OAuth + PG-backed sessions. Later phases add BullMQ, Ethereal sending, Slack, Elasticsearch, email dashboard.
+> Phase 5: distributed throttling + Slack + Elasticsearch + Bull Board (backend only; no frontend changes).
 
 ## Architecture
 
@@ -40,11 +40,15 @@ docker compose up -d
 
 # 2. Backend
 cd backend
-cp ../.env.example ../.env   # or copy to backend/.env — backend reads process env; root .env via dotenv
 npm install
+npm run prisma:migrate
 npm run dev                  # http://localhost:4000/api/health
 
-# 3. Frontend (new terminal)
+# 3. Worker (new terminal — required for emails to actually send)
+cd backend
+npm run worker:dev
+
+# 4. Frontend (new terminal)
 cd frontend
 npm install
 npm run dev                  # http://localhost:5173 (proxies /api → backend)
@@ -61,6 +65,8 @@ See `.env.example`. Phase 3 uses:
 | `REDIS_URL` | health check (queues in later phases) |
 | `SESSION_SECRET` | signs session cookies; must be a strong random value in production (server refuses to boot otherwise) |
 | `GOOGLE_CLIENT_ID` / `GOOGLE_CLIENT_SECRET` / `GOOGLE_CALLBACK_URL` | Google OAuth (see below) |
+| `ETHEREAL_HOST` / `ETHEREAL_PORT` / `ETHEREAL_USER` / `ETHEREAL_PASSWORD` / `ETHEREAL_FROM` | Ethereal SMTP (see below) |
+| `WORKER_CONCURRENCY` (default 5) / `MAX_ATTEMPTS` (default 3) | worker concurrency, BullMQ attempts |
 
 ## Google OAuth setup (local)
 
@@ -98,9 +104,151 @@ See `.env.example`. Phase 3 uses:
 - `GET /api/auth/google/callback` → upsert User, create session, 302 to `/dashboard` (failures → `/login?error=…`)
 - `GET /api/auth/me` → `{ authenticated: true, user }` or `401 UNAUTHENTICATED`
 - `POST /api/auth/logout` → `{ success: true }`, destroys session + clears cookie
+- `POST /api/emails/schedule` (auth) → `{ id, status, recipient, subject, scheduledAt, bullmqJobId, delayMs }` (201)
+- `GET /api/emails/scheduled` (auth) → own `SCHEDULED`+`PROCESSING` emails, `scheduledAt` ascending
+- `GET /api/emails/sent` (auth) → own `SENT` emails, `sentAt` descending
+- `GET /api/emails/:id` (auth) → own email detail or `404 EMAIL_NOT_FOUND`
+- `GET /api/emails/search?q=` (auth) → own emails matching recipient/subject/body/sender (Elasticsearch)
+- `GET /api/slack/connect` (auth) → 302 to Slack OAuth (or `503 SLACK_NOT_CONFIGURED`)
+- `GET /api/slack/callback` (auth) → stores connection, 302 to `/dashboard?slack=connected|error`
+- `GET /api/slack/status` (auth) → `{ connected, teamName }` (never the token)
+- `POST /api/slack/disconnect` (auth) → removes the connection
+- `GET /admin/queues/` → Bull Board (auth + `BULL_BOARD_ADMIN_EMAIL` only; 404 when unconfigured)
+
+## Email scheduling architecture (Phase 4)
+
+```
+Express API → PostgreSQL ScheduledEmail (SCHEDULED)
+            → BullMQ delayed job { emailId } → Redis (persistent, AOF)
+BullMQ Worker → claim SCHEDULED → PROCESSING (atomic conditional UPDATE)
+              → Ethereal SMTP → SENT (+sentAt) / FAILED (+errorMessage)
+```
+
+Why BullMQ delayed jobs instead of cron: each email is an individual
+durable job in Redis — no timers in process memory, no polling loops, no
+startup rescheduling. A delayed job fires once at the right time even if the
+API and worker both restarted in between. Concurrency (`WORKER_CONCURRENCY`),
+retries (3 attempts, exponential backoff 5s/10s/20s) and bounded history
+(`removeOnComplete`/`removeOnFail` caps) are all BullMQ-native.
+
+- **Database is source of truth.** Jobs carry only `{ emailId }`; every send
+  decision re-reads PostgreSQL. No email content in Redis.
+- **Deterministic job ids** (`email-<uuid>`, unique `bullmqJobId`): the same
+  row can never produce two queue jobs.
+- **Idempotency:** atomic `SCHEDULED → PROCESSING` claim (exactly one worker
+  wins); `SENT`/`FAILED` rows are never resent; missing rows complete
+  silently. A `PROCESSING` row seen by a fresh delivery is retried later if a
+  live worker owns it, or recovered if the claim is stale (crashed worker).
+- **Restart behavior:** nothing is recreated on boot. Delayed jobs stay in
+  Redis; the worker just consumes them. Verified: worker killed before due
+  time → job remained delayed → restarted worker sent it → `SENT`.
+- **Ethereal preview URLs:** logged by the worker (`email sent via ethereal`)
+  and safe to open (fake inbox). SMTP passwords never logged; error messages
+  are truncated and password-redacted before storage.
+- **Honest limitation (at-least-once, not exactly-once):** if SMTP accepts the
+  message and the worker crashes before writing `SENT`, the retry cannot know
+  the first send happened and may deliver twice. Concurrent duplicates are
+  prevented via claim + live-claim detection, but the SMTP-accepted/crash
+  window is inherent to any system without provider-side dedup.
+
+## Ethereal setup (local)
+
+1. Create a free account at https://ethereal.email (or run
+   `nodemailer.createTestAccount()` once) to get SMTP credentials.
+2. Put them in `backend/.env` (never commit):
+   ```
+   ETHEREAL_HOST=smtp.ethereal.email
+   ETHEREAL_PORT=587
+   ETHEREAL_USER=...@ethereal.email
+   ETHEREAL_PASSWORD=...
+   ```
+3. Start API + worker, schedule via `POST /api/emails/schedule`, watch the
+   worker log for the preview URL, open it to see the delivered message.
+
+## DB ↔ queue consistency window
+
+PostgreSQL and Redis cannot commit atomically. Order is DB-first (row +
+campaign in one Prisma transaction), then enqueue, then persist `bullmqJobId`.
+If persisting the job id fails, the just-created job is removed best-effort so
+a row the API reported as failed can never be sent. Each `POST /schedule`
+creates a new logical email (no client idempotency key in Phase 4) — do not
+blindly retry 500s.
+
+## Distributed rate limiting + minimum delay (Phase 5)
+
+One atomic Lua script per send attempt (`src/services/send-reservation.service.ts`):
+
+- Keys: `email:throttle:{senderId}` (next-allowed epoch ms) and
+  `email:rate:{senderId}:{YYYY-MM-DDTHH}` (reserved sends in that UTC hour).
+- The script computes `sendAt = max(now, throttle)`, picks the hour bucket
+  containing `sendAt`, rejects when full (`RATE_LIMIT`, retry at next hour
+  boundary), else increments the bucket and advances the throttle. No
+  check-then-set race across any number of workers/instances; no in-memory
+  state, so restarts change nothing (verified: counters read back over a fresh
+  connection).
+- Reservation happens BEFORE SMTP (conservative: a crash after reserving
+  under-sends, never over-sends). Failed SMTP sends do not refund capacity.
+- `MIN_SEND_DELAY_MS` (default 2000) is global per sender in this phase.
+
+### Rescheduling (no sleep, no polling, no retries consumed)
+
+When the slot is in the future or the hour is full, the worker creates a
+replacement delayed job (`email-<uuid>-<slotMs>`, distinct ids per slot so
+completed-job history never collides), flips the row `PROCESSING → SCHEDULED`
+with the new `scheduledAt`/`bullmqJobId`, and completes the current job
+successfully. The replacement re-fires at the slot and re-runs reservation.
+Only replacement jobs (`reserved: true`) may send on a matured slot — initial
+jobs always bid, so bursts serialize instead of sending at once, and
+throttle leapfrog can never livelock (found + fixed live in this phase).
+
+### Ordering
+
+Slots are reserved monotonically per sender and `scheduledAt` tracks the slot,
+so order is preserved in the common case. Strict global ordering is NOT
+guaranteed under concurrency (documented limitation).
+
+## Slack integration (Phase 5)
+
+- OAuth: `GET /api/slack/connect` stores an unguessable `state` in the
+  server session and 302s to Slack (`chat:write,im:write,users:read` — minimum
+  for DMing the user). The callback validates `state` (timing-safe) and uses
+  the session identity — never a query-param user id — then upserts one
+  `SlackConnection` per user (reconnect replaces).
+- Rate-limit alerts: DM via `conversations.open` + `chat.postMessage` with
+  sender, limit, UTC hour, next window, pending count. Idempotent per
+  sender+hour via atomic `SET … NX EX` (`slack:alert:{senderId}:{hour}`) — 10
+  simultaneous workers produce 1 message. Sending never throws: unconnected
+  workspace or Slack outage only logs; email flow always continues.
+
+## Elasticsearch (Phase 5)
+
+Index `reachinbox-emails` (mapping in `src/lib/elasticsearch.ts`; created
+lazily, never at boot). Documents are upserted on scheduled/sent/failed/
+rescheduled via a never-throwing wrapper (also guarded inside the worker), so
+an ES outage cannot fail email. PostgreSQL stays the source of truth
+(eventual consistency). `GET /api/emails/search` runs a real `multi_match`
+(recipient^3, subject^2, body, senderEmail^2) always filtered by `userId`.
+
+## Bull Board (Phase 5)
+
+`GET /admin/queues/` serves the live `email-send` board. Always behind
+`requireAuth`; if `BULL_BOARD_ADMIN_EMAIL` is unset the route is 404 (never
+public by default); if set, only that user gets 200, others 403.
+
+## Known failure windows (Phase 5 additions)
+
+- Reservation before SMTP + crash → capacity consumed without sending
+  (under-send by design).
+- SMTP accepted + crash before `SENT` → retry may duplicate (at-least-once).
+- ES is eventually consistent; Slack alerts are best-effort.
+- `MIN_SEND_DELAY_MS` is assumed ≪ 1h (slots always fall in the current or
+  next UTC hour bucket).
 
 ## Verification
 
 - Backend: `cd backend; npm run typecheck; npm run lint; npm run build; npm test`
 - Frontend: `cd frontend; npm run typecheck; npm run lint; npm run build`
 - DB: `cd backend; npm run prisma:migrate; npm run db:check`
+- Tests use real PostgreSQL/Redis/Elasticsearch and isolated BullMQ queues
+  per test file (`EMAIL_QUEUE_NAME` override) so parallel suites can't steal
+  each other's jobs.

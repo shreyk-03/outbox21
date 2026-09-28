@@ -1,5 +1,6 @@
 import type { NextFunction, Request, Response } from 'express';
 import { getEmailById, getScheduledEmails, getSentEmails, scheduleEmail } from '../services/email-scheduler.service.js';
+import { searchEmails } from '../services/email-search.service.js';
 
 export async function scheduleHandler(req: Request, res: Response, next: NextFunction): Promise<void> {
   try {
@@ -32,6 +33,15 @@ export async function detailHandler(req: Request, res: Response, next: NextFunct
   try {
     const email = await getEmailById(req.authUser!.id, req.params.id as string);
     res.status(200).json(email);
+  } catch (err) {
+    next(err);
+  }
+}
+
+export async function searchHandler(req: Request, res: Response, next: NextFunction): Promise<void> {
+  try {
+    const emails = await searchEmails(req.authUser!.id, String(req.query.q ?? ''));
+    res.status(200).json({ emails });
   } catch (err) {
     next(err);
   }

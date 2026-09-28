@@ -4,11 +4,14 @@ import helmet from 'helmet';
 import pinoHttp from 'pino-http';
 import { assertProductionSecrets, env } from './config/env.js';
 import { configureGoogleOAuth } from './config/google-oauth.js';
+import { getBullBoardRouter, requireBullBoardAdmin } from './lib/bull-board.js';
 import { buildSessionMiddleware } from './lib/session.js';
 import { errorMiddleware, notFoundMiddleware } from './middleware/error.middleware.js';
+import { requireAuth } from './middleware/auth.middleware.js';
 import { authRouter } from './routes/auth.routes.js';
 import { emailsRouter } from './routes/emails.routes.js';
 import { healthRouter } from './routes/health.routes.js';
+import { slackRouter } from './routes/slack.routes.js';
 
 export function createApp() {
   assertProductionSecrets();
@@ -34,6 +37,9 @@ export function createApp() {
   app.use('/api', healthRouter);
   app.use('/api', authRouter);
   app.use('/api', emailsRouter);
+  app.use('/api', slackRouter);
+
+  app.use('/admin/queues', requireAuth, requireBullBoardAdmin, getBullBoardRouter());
 
   app.use(notFoundMiddleware);
   app.use(errorMiddleware);

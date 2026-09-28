@@ -3,6 +3,7 @@ import { prisma } from '../lib/prisma.js';
 import { logger } from '../lib/logger.js';
 import { AppError } from '../middleware/error.middleware.js';
 import { emailJobId, getEmailQueue } from '../queues/email.queue.js';
+import { indexEmailByIdSafe } from './email-search.service.js';
 
 export const scheduleEmailSchema = z.object({
   senderId: z.string().uuid('senderId must be a valid UUID'),
@@ -84,9 +85,9 @@ export async function scheduleEmail(userId: string, rawInput: unknown): Promise<
     });
   });
 
-  const jobId = emailJobId(email.id);
+  const jobId = emailJobId(email.id, scheduledAt.getTime());
   const queue = getEmailQueue();
-  const job = await queue.add('send', { emailId: email.id }, { jobId, delay: delayMs });
+  const job = await queue.add('send', { emailId: email.id, slotMs: scheduledAt.getTime() }, { jobId, delay: delayMs });
 
   try {
     await prisma.scheduledEmail.update({ where: { id: email.id }, data: { bullmqJobId: job.id as string } });
@@ -97,6 +98,7 @@ export async function scheduleEmail(userId: string, rawInput: unknown): Promise<
   }
 
   logger.info({ emailId: email.id, jobId: job.id, delayMs }, 'email scheduled');
+  await indexEmailByIdSafe(email.id);
   return {
     id: email.id,
     status: email.status,
