@@ -1,11 +1,11 @@
 # ReachInbox Email Scheduler
 
-> Phase 1 scaffold. Later phases add Prisma, Google/Slack OAuth, BullMQ, Ethereal sending, Elasticsearch, Bull Board, full dashboard, tests.
+> Phase 3: real Google OAuth + PG-backed sessions. Later phases add BullMQ, Ethereal sending, Slack, Elasticsearch, email dashboard.
 
-## Architecture (Phase 1)
+## Architecture
 
 ```
-React (Vite) → Express API → health check → Redis / PostgreSQL ping
+React (Vite) → Express API → PostgreSQL (source of truth: users, sessions)
 ```
 
 Full target architecture (later phases):
@@ -16,6 +16,14 @@ Frontend → Express API → PostgreSQL (source of truth)
 BullMQ Worker → Redis + PostgreSQL → Ethereal SMTP
 Email → Elasticsearch index
 Rate limit → Redis atomic counter → reschedule + Slack alert
+```
+
+Auth flow (Phase 3):
+
+```
+Browser → GET /api/auth/google → Google consent → callback
+→ upsert User by googleId → regenerate session, store userId in PG "session" table
+→ 302 to /dashboard (HTTP-only cookie)
 ```
 
 ## Prerequisites
@@ -44,24 +52,55 @@ npm run dev                  # http://localhost:5173 (proxies /api → backend)
 
 ## Environment variables
 
-See `.env.example`. Phase 1 uses only:
+See `.env.example`. Phase 3 uses:
 
-| Var | Purpose | Default |
-|-----|---------|---------|
-| `NODE_ENV` | env mode | `development` |
-| `PORT` | backend port | `4000` |
-| `FRONTEND_URL` | CORS origin | `http://localhost:5173` |
-| `DATABASE_URL` | postgres ping | local compose URL |
-| `REDIS_URL` | redis ping | `redis://localhost:6379` |
-| `SESSION_SECRET` | (Phase 3) | — |
+| Var | Purpose |
+|-----|---------|
+| `NODE_ENV` / `PORT` / `FRONTEND_URL` | server mode, port, CORS origin + post-login redirect base |
+| `DATABASE_URL` | PostgreSQL (users + `session` table) |
+| `REDIS_URL` | health check (queues in later phases) |
+| `SESSION_SECRET` | signs session cookies; must be a strong random value in production (server refuses to boot otherwise) |
+| `GOOGLE_CLIENT_ID` / `GOOGLE_CLIENT_SECRET` / `GOOGLE_CALLBACK_URL` | Google OAuth (see below) |
 
-Remaining vars (Google/Slack/Ethereal/ES/worker) are placeholders for later phases.
+## Google OAuth setup (local)
 
-## API (Phase 1)
+1. Open [Google Cloud Console → APIs & Services → Credentials](https://console.cloud.google.com/apis/credentials), create an **OAuth client ID** (type: Web application).
+2. Authorized JavaScript origin: `http://localhost:5173`
+3. Authorized redirect URI: `http://localhost:4000/api/auth/google/callback`
+4. Copy the client ID/secret into backend env:
+   ```
+   GOOGLE_CLIENT_ID=...
+   GOOGLE_CLIENT_SECRET=...
+   GOOGLE_CALLBACK_URL=http://localhost:4000/api/auth/google/callback
+   SESSION_SECRET=<long random string>
+   ```
+5. Start backend (`cd backend; npm run dev`) and frontend (`cd frontend; npm run dev`).
+6. Visit `http://localhost:5173/login` → **Continue with Google** → consent → lands on `/dashboard` showing avatar, name, email.
+7. Refresh: session persists (PostgreSQL-backed, survives backend restarts).
+8. Logout → redirected to `/login`; visiting `/dashboard` redirects back to `/login`.
 
-- `GET /api/health` → `{ status: "ok", redis: "connected"|"disconnected", database: "connected"|"disconnected" }`
+> Note: real Google sign-in has NOT been exercised in this environment (no
+> OAuth credentials configured here); the full stack up to Google's consent
+> screen plus session handling is covered by automated tests + the manual
+> steps above. Without credentials, `/api/auth/google` returns
+> `503 OAUTH_NOT_CONFIGURED` instead of crashing.
+
+## Sessions
+
+- `express-session` + `connect-pg-simple` over the `session` table (Prisma `Session` model owns the DDL; the store accesses it directly).
+- Cookie `reachinbox.sid`: HTTP-only, `SameSite=lax`, `secure` in production, 7-day expiry. No tokens in localStorage; `/api/auth/me` returns only `id/name/email/avatarUrl`.
+- Identity = `req.session.userId`, reloaded from PostgreSQL per request (`requireAuth`); stale sessions → 401. Session id is regenerated at login (fixation protection).
+
+## API
+
+- `GET /api/health` → `{ status: "ok", redis, database }`
+- `GET /api/auth/google` → 302 to Google (or `503 OAUTH_NOT_CONFIGURED`)
+- `GET /api/auth/google/callback` → upsert User, create session, 302 to `/dashboard` (failures → `/login?error=…`)
+- `GET /api/auth/me` → `{ authenticated: true, user }` or `401 UNAUTHENTICATED`
+- `POST /api/auth/logout` → `{ success: true }`, destroys session + clears cookie
 
 ## Verification
 
-- Backend typecheck: `cd backend; npm run typecheck`
-- Frontend typecheck: `cd frontend; npm run typecheck`
+- Backend: `cd backend; npm run typecheck; npm run lint; npm run build; npm test`
+- Frontend: `cd frontend; npm run typecheck; npm run lint; npm run build`
+- DB: `cd backend; npm run prisma:migrate; npm run db:check`

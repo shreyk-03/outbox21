@@ -124,3 +124,18 @@ model SlackConnection {
   createdAt   DateTime @default(now())
   updatedAt   DateTime @updatedAt
 }
+
+// Server-side session storage for express-session (connect-pg-simple).
+// Why a Prisma model: the table must be versioned with our migrations rather
+// than auto-created at runtime, and it must never be confused with
+// application email data (no relations to User — rows are keyed by opaque
+// sid and pruned by expire). connect-pg-simple reads/writes this table
+// directly with its own pg pool; Prisma only owns the DDL.
+model Session {
+  sid    String   @id @db.VarChar
+  sess   Json
+  expire DateTime @db.Timestamp(6)
+
+  @@map("session")
+  @@index([expire])
+}
