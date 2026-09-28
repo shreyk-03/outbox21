@@ -1,0 +1,126 @@
+// ReachInbox Email Scheduler — database layer (Phase 2).
+//
+// Constraint strategy:
+// - Prisma enforces shape, FKs, uniqueness, indexes, defaults, cascade rules.
+// - Business validation (email format, delayMs >= 0, hourlyLimit > 0,
+//   recipient parsing/dedup, scheduling rules) is enforced in the service
+//   layer with Zod in later phases — NOT in the schema.
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+enum EmailStatus {
+  SCHEDULED
+  PROCESSING
+  SENT
+  FAILED
+}
+
+model User {
+  id        String   @id @default(uuid()) @db.Uuid
+  googleId  String   @unique
+  email     String   @unique
+  name      String
+  avatarUrl String?
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  senders         Sender[]
+  campaigns       EmailCampaign[]
+  scheduledEmails ScheduledEmail[]
+  slackConnection SlackConnection?
+}
+
+model Sender {
+  id          String   @id @default(uuid()) @db.Uuid
+  userId      String   @db.Uuid
+  user        User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  email       String
+  name        String
+  hourlyLimit Int      @default(200)
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  campaigns       EmailCampaign[]
+  scheduledEmails ScheduledEmail[]
+
+  @@unique([userId, email])
+  @@index([userId])
+}
+
+model EmailCampaign {
+  id          String   @id @default(uuid()) @db.Uuid
+  userId      String   @db.Uuid
+  user        User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  senderId    String   @db.Uuid
+  sender      Sender   @relation(fields: [senderId], references: [id], onDelete: Restrict)
+  subject     String
+  body        String   @db.Text
+  startTime   DateTime @db.Timestamptz(6)
+  delayMs     Int      @default(2000)
+  hourlyLimit Int
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  scheduledEmails ScheduledEmail[]
+
+  @@index([userId])
+  @@index([senderId])
+  @@index([startTime])
+}
+
+model ScheduledEmail {
+  id           String      @id @default(uuid()) @db.Uuid
+  campaignId   String      @db.Uuid
+  campaign     EmailCampaign @relation(fields: [campaignId], references: [id], onDelete: Cascade)
+  userId       String      @db.Uuid
+  user         User        @relation(fields: [userId], references: [id], onDelete: Cascade)
+  senderId     String      @db.Uuid
+  sender       Sender      @relation(fields: [senderId], references: [id], onDelete: Restrict)
+  recipient    String
+  subject      String
+  body         String      @db.Text
+  scheduledAt  DateTime    @db.Timestamptz(6)
+  sentAt       DateTime?   @db.Timestamptz(6)
+  status       EmailStatus @default(SCHEDULED)
+  attempts     Int         @default(0)
+  // Nullable + unique: the DB row is created before the BullMQ job exists
+  // (NULL), then the deterministic job id is written once. PostgreSQL treats
+  // NULLs as distinct, so multiple unscheduled rows can coexist while every
+  // real job id stays unique for idempotency.
+  bullmqJobId  String?     @unique
+  errorMessage String?     @db.Text
+  createdAt    DateTime    @default(now())
+  updatedAt    DateTime    @updatedAt
+
+  @@index([userId])
+  @@index([senderId])
+  @@index([campaignId])
+  @@index([recipient])
+  @@index([status])
+  @@index([scheduledAt])
+  @@index([createdAt])
+  // Worker scan: claim due emails per sender in status/schedule order.
+  @@index([senderId, status, scheduledAt])
+  // Dashboard lists: a user's emails by status/recency.
+  @@index([userId, status, scheduledAt])
+}
+
+model SlackConnection {
+  id          String   @id @default(uuid()) @db.Uuid
+  // One active connection per user: reconnecting upserts this row instead of
+  // creating duplicates. @unique also provides the lookup index on userId.
+  userId      String   @unique @db.Uuid
+  user        User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  accessToken String   @db.Text
+  teamId      String?
+  teamName    String?
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+}

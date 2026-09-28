@@ -1,0 +1,45 @@
+# Node
+node_modules/
+dist/
+build/
+
+# Env
+.env
+.env.local
+*.local
+
+# Logs
+logs/
+*.log
+npm-debug.log*
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Frontend
+frontend/dist/
+frontend/node_modules/
+
+# Backend
+backend/dist/
+backend/node_modules/
+
+# Prisma
+backend/prisma/migrations/
+
+# Docker volumes (persisted via named volumes, but ignore local data dirs)
+data/
+pgdata/
+redisdata/
+esdata/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Misc
+coverage/
+.nyc_output/
