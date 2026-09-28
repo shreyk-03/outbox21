@@ -7,6 +7,7 @@ import { configureGoogleOAuth } from './config/google-oauth.js';
 import { buildSessionMiddleware } from './lib/session.js';
 import { errorMiddleware, notFoundMiddleware } from './middleware/error.middleware.js';
 import { authRouter } from './routes/auth.routes.js';
+import { emailsRouter } from './routes/emails.routes.js';
 import { healthRouter } from './routes/health.routes.js';
 
 export function createApp() {
@@ -32,6 +33,7 @@ export function createApp() {
 
   app.use('/api', healthRouter);
   app.use('/api', authRouter);
+  app.use('/api', emailsRouter);
 
   app.use(notFoundMiddleware);
   app.use(errorMiddleware);
