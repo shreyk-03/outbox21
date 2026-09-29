@@ -41,7 +41,7 @@ export function DashboardLayout() {
 
   return (
     <div className="min-h-screen bg-slate-50 text-slate-900">
-      <div className="mx-auto flex min-h-screen max-w-6xl">
+      <div className="flex min-h-screen w-full">
         {/* Sidebar */}
         <aside
           className={`${
@@ -122,7 +122,7 @@ export function DashboardLayout() {
               <SearchBar compact />
             </div>
           </header>
-          <main className="flex-1 p-4 md:p-6">
+          <main className="flex-1 px-4 py-4 md:px-8 md:py-6">
             <Outlet />
           </main>
         </div>

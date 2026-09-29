@@ -116,7 +116,7 @@ export function ComposePage() {
 
   if (result) {
     return (
-      <div className="max-w-lg space-y-3 rounded-lg border border-green-200 bg-green-50 p-6" role="status">
+      <div className="w-full max-w-2xl space-y-3 rounded-lg border border-green-200 bg-green-50 p-6" role="status">
         <h2 className="text-lg font-semibold text-green-900">Scheduled successfully</h2>
         <dl className="space-y-1 text-sm text-green-900">
           <div className="flex justify-between"><dt>Emails scheduled</dt><dd className="font-semibold">{result.scheduled}</dd></div>
@@ -137,7 +137,7 @@ export function ComposePage() {
   }
 
   return (
-    <form onSubmit={handleSubmit} className="max-w-2xl space-y-5" noValidate>
+    <form onSubmit={handleSubmit} className="w-full max-w-5xl space-y-6" noValidate>
       <div className="space-y-2">
         <Select
           label="Sender"
@@ -194,7 +194,7 @@ export function ComposePage() {
         {mode === 'manual' ? (
           <Textarea
             label="Recipients"
-            rows={4}
+            rows={6}
             value={manualText}
             onChange={(e) => {
               setManualText(e.target.value);
@@ -237,7 +237,7 @@ export function ComposePage() {
       />
       <Textarea
         label="Body"
-        rows={6}
+        rows={10}
         value={body}
         onChange={(e) => {
           setBody(e.target.value);

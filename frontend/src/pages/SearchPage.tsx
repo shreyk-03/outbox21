@@ -17,7 +17,7 @@ export function SearchPage() {
 
   return (
     <div className="space-y-4">
-      <form role="search" onSubmit={(e) => e.preventDefault()} className="max-w-md">
+      <form role="search" onSubmit={(e) => e.preventDefault()} className="w-full max-w-2xl">
         <label htmlFor="search-input" className="sr-only">
           Search emails
         </label>

@@ -29,7 +29,7 @@ export function SlackPage() {
     );
 
   return (
-    <div className="max-w-lg space-y-4 rounded-lg border border-slate-200 bg-white p-6">
+    <div className="w-full max-w-2xl space-y-4 rounded-lg border border-slate-200 bg-white p-6">
       <h2 className="text-lg font-semibold">Slack integration</h2>
       <p className="text-sm text-slate-600">
         When a sender hits its hourly email limit, ReachInbox posts a single alert to your workspace and reschedules
