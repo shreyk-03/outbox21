@@ -6,7 +6,7 @@
   "scripts": {
     "dev": "tsx watch src/server.ts",
     "build": "prisma generate && tsc -p tsconfig.json",
-    "start": "node dist/server.js",
+    "start": "node dist/server.js & node dist/worker.js",
     "worker:dev": "tsx watch src/worker.ts",
     "worker": "node dist/worker.js",
     "typecheck": "tsc --noEmit",
