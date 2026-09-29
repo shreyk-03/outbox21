@@ -153,3 +153,127 @@ export async function getEmailById(userId: string, id: string) {
   }
   return email;
 }
+
+export const MAX_BULK_RECIPIENTS = 1000;
+
+export const scheduleBulkSchema = z.object({
+  senderId: z.string().uuid('senderId must be a valid UUID'),
+  subject: z.string().trim().min(1, 'subject is required').max(998),
+  body: z.string().min(1, 'body is required').max(200_000),
+  scheduledAt: z.coerce.date({ invalid_type_error: 'scheduledAt must be a valid ISO timestamp' }),
+  delayMs: z.coerce.number().int('delayMs must be an integer').min(0).max(3_600_000).default(2000),
+  recipients: z
+    .array(z.string().trim().toLowerCase().email('every recipient must be a valid email address').max(320))
+    .min(1, 'at least one recipient is required')
+    .max(MAX_BULK_RECIPIENTS, `at most ${MAX_BULK_RECIPIENTS} recipients per request`),
+});
+
+export type ScheduleBulkInput = z.infer<typeof scheduleBulkSchema>;
+
+export interface ScheduleBulkResult {
+  campaignId: string;
+  totalRecipients: number;
+  scheduled: number;
+  failed: number;
+  duplicatesRemoved: number;
+  startTime: Date;
+  status: 'scheduled';
+}
+
+/**
+ * Schedule one campaign for many recipients. Each email gets its own
+ * staggered slot (startTime + i * delayMs), its own DB row and its own
+ * BullMQ delayed job, so the existing worker, rate limiting and idempotency
+ * behavior apply unchanged. Duplicates (case-insensitive) are removed and
+ * reported, never sent twice.
+ */
+export async function scheduleBulkEmails(userId: string, rawInput: unknown): Promise<ScheduleBulkResult> {
+  const parsed = scheduleBulkSchema.safeParse(rawInput);
+  if (!parsed.success) {
+    const message = parsed.error.issues.map((i) => `${i.path.join('.') || 'body'}: ${i.message}`).join('; ');
+    throw new AppError(400, 'VALIDATION_ERROR', message);
+  }
+  const input = parsed.data;
+
+  const sender = await prisma.sender.findFirst({ where: { id: input.senderId, userId } });
+  if (!sender) {
+    throw new AppError(404, 'SENDER_NOT_FOUND', 'Sender not found');
+  }
+
+  const seen = new Set<string>();
+  const uniqueRecipients: string[] = [];
+  for (const r of input.recipients) {
+    if (!seen.has(r)) {
+      seen.add(r);
+      uniqueRecipients.push(r);
+    }
+  }
+  const duplicatesRemoved = input.recipients.length - uniqueRecipients.length;
+
+  const startTime = input.scheduledAt;
+  const campaign = await prisma.emailCampaign.create({
+    data: {
+      userId,
+      senderId: sender.id,
+      subject: input.subject,
+      body: input.body,
+      startTime,
+      delayMs: input.delayMs,
+      hourlyLimit: sender.hourlyLimit,
+    },
+  });
+
+  const rows = await prisma.$transaction(
+    uniqueRecipients.map((recipient, i) =>
+      prisma.scheduledEmail.create({
+        data: {
+          campaignId: campaign.id,
+          userId,
+          senderId: sender.id,
+          recipient,
+          subject: input.subject,
+          body: input.body,
+          scheduledAt: new Date(startTime.getTime() + i * input.delayMs),
+        },
+      }),
+    ),
+  );
+
+  // Enqueue one delayed job per row. A single job failure must not fail the
+  // whole batch: the affected row is marked FAILED and counted.
+  const queue = getEmailQueue();
+  let scheduled = 0;
+  let failed = 0;
+  for (const email of rows) {
+    const slotMs = email.scheduledAt.getTime();
+    const jobId = emailJobId(email.id, slotMs);
+    try {
+      const job = await queue.add(
+        'send',
+        { emailId: email.id, slotMs },
+        { jobId, delay: Math.max(0, slotMs - Date.now()) },
+      );
+      await prisma.scheduledEmail.update({ where: { id: email.id }, data: { bullmqJobId: job.id as string } });
+      scheduled += 1;
+    } catch (err) {
+      logger.warn({ err, emailId: email.id }, 'bulk enqueue failed for one recipient');
+      await prisma.scheduledEmail
+        .update({ where: { id: email.id }, data: { status: 'FAILED', errorMessage: 'Failed to enqueue send job' } })
+        .catch(() => undefined);
+      failed += 1;
+    }
+  }
+
+  logger.info({ campaignId: campaign.id, scheduled, failed, duplicatesRemoved }, 'bulk emails scheduled');
+  await Promise.all(rows.map((r) => indexEmailByIdSafe(r.id)));
+
+  return {
+    campaignId: campaign.id,
+    totalRecipients: uniqueRecipients.length,
+    scheduled,
+    failed,
+    duplicatesRemoved,
+    startTime,
+    status: 'scheduled',
+  };
+}

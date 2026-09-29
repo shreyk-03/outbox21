@@ -1,6 +1,6 @@
 # ReachInbox Email Scheduler
 
-> Phase 5: distributed throttling + Slack + Elasticsearch + Bull Board (backend only; no frontend changes).
+> Phase 6: complete frontend application (dashboard, compose, search, Slack UI) + sender/bulk backend endpoints.
 
 ## Architecture
 
@@ -114,6 +114,9 @@ See `.env.example`. Phase 3 uses:
 - `GET /api/slack/status` (auth) → `{ connected, teamName }` (never the token)
 - `POST /api/slack/disconnect` (auth) → removes the connection
 - `GET /admin/queues/` → Bull Board (auth + `BULL_BOARD_ADMIN_EMAIL` only; 404 when unconfigured)
+- `GET /api/senders` (auth) → own senders `{ id, email, name, hourlyLimit }`
+- `POST /api/senders` (auth) → create sender (email unique per user; 409 `SENDER_EXISTS`)
+- `POST /api/emails/schedule/bulk` (auth) → one campaign + staggered jobs; `{ campaignId, totalRecipients, scheduled, failed, duplicatesRemoved, startTime, status }` (201, max 1000 recipients)
 
 ## Email scheduling architecture (Phase 4)
 
@@ -244,10 +247,40 @@ public by default); if set, only that user gets 200, others 403.
 - `MIN_SEND_DELAY_MS` is assumed ≪ 1h (slots always fall in the current or
   next UTC hour bucket).
 
+## Frontend application (Phase 6)
+
+Routes (all `/dashboard/*` protected; `/login` redirects away when authenticated):
+
+- `/login` — Google OAuth entry, backend error messages
+- `/dashboard` — overview cards (scheduled/sent/senders/Slack) derived from
+  live queries, next-up list, Slack callback toasts
+- `/dashboard/scheduled`, `/dashboard/sent` — tables with status badges,
+  detail modal (`GET /api/emails/:id`), loading/empty/error states
+- `/dashboard/compose` — sender select + inline sender creation, manual or
+  CSV/TXT recipients with live valid/invalid/duplicate counts, subject/body,
+  local-time start, delay presets (2s–1min + custom ms), read-only sender
+  hourly limit, result panel + scheduled-list invalidation
+- `/dashboard/search` — debounced (400ms) Elasticsearch search
+- `/dashboard/slack` — connect/disconnect, team name, no tokens in UI
+
+Notes:
+
+- Bulk scheduling (`POST /api/emails/schedule/bulk`, max 1000) creates one
+  campaign with staggered slots; duplicates are removed and counted. The
+  sender's `hourlyLimit` is always enforced server-side.
+- CSV: header-aware email-column detection (else most email-like column);
+  quoted commas supported. TXT/manual: one address per line, commas/semicolons
+  also split. Parsing is local; only validated addresses are submitted.
+- Auth is cookie-session based; nothing secret touches localStorage. Server
+  state lives in TanStack Query with retries capped and 15s stale time.
+- No Figma assets exist in the repo, so styling is an original clean SaaS
+  design (Tailwind, responsive sidebar → hamburger under `md`, scrollable
+  tables). Not visually verified in a real browser in this environment.
+
 ## Verification
 
 - Backend: `cd backend; npm run typecheck; npm run lint; npm run build; npm test`
-- Frontend: `cd frontend; npm run typecheck; npm run lint; npm run build`
+- Frontend: `cd frontend; npm run typecheck; npm run lint; npm run build; npm test`
 - DB: `cd backend; npm run prisma:migrate; npm run db:check`
 - Tests use real PostgreSQL/Redis/Elasticsearch and isolated BullMQ queues
   per test file (`EMAIL_QUEUE_NAME` override) so parallel suites can't steal

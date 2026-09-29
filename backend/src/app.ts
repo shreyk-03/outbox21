@@ -11,6 +11,7 @@ import { requireAuth } from './middleware/auth.middleware.js';
 import { authRouter } from './routes/auth.routes.js';
 import { emailsRouter } from './routes/emails.routes.js';
 import { healthRouter } from './routes/health.routes.js';
+import { sendersRouter } from './routes/senders.routes.js';
 import { slackRouter } from './routes/slack.routes.js';
 
 export function createApp() {
@@ -37,6 +38,7 @@ export function createApp() {
   app.use('/api', healthRouter);
   app.use('/api', authRouter);
   app.use('/api', emailsRouter);
+  app.use('/api', sendersRouter);
   app.use('/api', slackRouter);
 
   app.use('/admin/queues', requireAuth, requireBullBoardAdmin, getBullBoardRouter());

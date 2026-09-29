@@ -2,6 +2,7 @@ import { Router } from 'express';
 import {
   detailHandler,
   scheduledHandler,
+  scheduleBulkHandler,
   searchHandler,
   sentHandler,
   scheduleHandler,
@@ -13,6 +14,7 @@ export const emailsRouter = Router();
 emailsRouter.use(requireAuth);
 
 emailsRouter.post('/emails/schedule', scheduleHandler);
+emailsRouter.post('/emails/schedule/bulk', scheduleBulkHandler);
 emailsRouter.get('/emails/scheduled', scheduledHandler);
 emailsRouter.get('/emails/sent', sentHandler);
 // NOTE: /search must precede /:id or Express would treat "search" as an id.

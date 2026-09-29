@@ -1,10 +1,25 @@
 import type { NextFunction, Request, Response } from 'express';
-import { getEmailById, getScheduledEmails, getSentEmails, scheduleEmail } from '../services/email-scheduler.service.js';
+import {
+  getEmailById,
+  getScheduledEmails,
+  getSentEmails,
+  scheduleBulkEmails,
+  scheduleEmail,
+} from '../services/email-scheduler.service.js';
 import { searchEmails } from '../services/email-search.service.js';
 
 export async function scheduleHandler(req: Request, res: Response, next: NextFunction): Promise<void> {
   try {
     const result = await scheduleEmail(req.authUser!.id, req.body);
+    res.status(201).json(result);
+  } catch (err) {
+    next(err);
+  }
+}
+
+export async function scheduleBulkHandler(req: Request, res: Response, next: NextFunction): Promise<void> {
+  try {
+    const result = await scheduleBulkEmails(req.authUser!.id, req.body);
     res.status(201).json(result);
   } catch (err) {
     next(err);
