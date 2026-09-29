@@ -37,11 +37,16 @@ function withTimeout<T>(p: Promise<T>, ms: number): Promise<T> {
 }
 
 export async function checkRedis(): Promise<'connected' | 'disconnected'> {
-  try {
-    const client = getRedis();
-    await withTimeout(client.ping(), 2000);
-    return 'connected';
-  } catch {
-    return 'disconnected';
+  // One retry: the lazy client may still be establishing its first connection
+  // when a fresh-booted API serves its first health check (observed as a
+  // transient "disconnected" that clears on the next call).
+  for (let attempt = 0; attempt < 2; attempt++) {
+    try {
+      await withTimeout(getRedis().ping(), 2000);
+      return 'connected';
+    } catch {
+      await new Promise((r) => setTimeout(r, 300));
+    }
   }
+  return 'disconnected';
 }

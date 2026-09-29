@@ -192,6 +192,16 @@ One atomic Lua script per send attempt (`src/services/send-reservation.service.t
 - Reservation happens BEFORE SMTP (conservative: a crash after reserving
   under-sends, never over-sends). Failed SMTP sends do not refund capacity.
 - `MIN_SEND_DELAY_MS` (default 2000) is global per sender in this phase.
+- Spacing semantic: the gate enforces minimum delay between send STARTS
+  (SMTP handoffs). Completion times (`sentAt`) can cluster closer together
+  when a slow send overlaps a fast one — bounded by SMTP latency variance.
+  A second atomic Lua script (`claimSendSlot`, key
+  `email:lastsend:{senderId}`) admits exactly one contender per delay window;
+  denied contenders reschedule briefly without consuming a retry. Verified
+  live: 3 sends with a 10s delay completed 10.4–10.9s apart.
+- Duplicate BullMQ ids are safe by construction: adding a job with an
+  existing id returns the original (no overwrite, verified live), and the
+  `bullmqJobId` uniqueness + atomic claim prevent double sends.
 
 ### Rescheduling (no sleep, no polling, no retries consumed)
 
@@ -280,8 +290,30 @@ Notes:
 ## Verification
 
 - Backend: `cd backend; npm run typecheck; npm run lint; npm run build; npm test`
+  (76 tests across 8 files, all against real PostgreSQL/Redis/Elasticsearch)
 - Frontend: `cd frontend; npm run typecheck; npm run lint; npm run build; npm test`
+  (34 tests across 10 files, jsdom + mocked API layer)
 - DB: `cd backend; npm run prisma:migrate; npm run db:check`
 - Tests use real PostgreSQL/Redis/Elasticsearch and isolated BullMQ queues
   per test file (`EMAIL_QUEUE_NAME` override) so parallel suites can't steal
-  each other's jobs.
+  each other's jobs. Reservation-sensitive processor tests additionally use
+  dedicated Redis keys or fully stubbed slots — sharing one sender's throttle
+  across tests with different concerns caused false failures during Phase 7 QA
+  (the app code was correct; fixed test-side).
+
+## Production QA notes (Phase 7)
+
+- Live-verified with real Ethereal SMTP: 12-recipient bulk → 12/12 SENT,
+  exactly once each; hourlyLimit=1 with 3 emails → exactly 1 SENT, 2
+  rescheduled to the next hour boundary; ES stopped mid-run → schedule + SENT
+  still succeeded; cross-user API isolation (detail/sent/search/senders/bulk/
+  Slack) returns 404/empty for strangers with a 200 positive control.
+- `npm audit`: backend 9 (3 moderate/5 high/1 critical), frontend 7
+  (5 moderate/1 high/1 critical). Every available fix is a semver-major bump
+  (nodemailer 6→10, prisma, vitest, react-router 6→7) — deliberately NOT
+  applied to avoid destabilizing the stack. Nodemailer 6.x advisories
+  (recipient-domain comment parsing, DNS-cache TLS servername) only matter
+  against adversarial recipients; traffic here is Ethereal test mail.
+- Live browser visual verification was not available in this environment;
+  responsive claims rest on Tailwind classes + component tests. Google/Slack
+  live click-throughs were not performed (no credentials configured).

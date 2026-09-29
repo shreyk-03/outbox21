@@ -28,6 +28,10 @@ export function throttleKeyFor(senderId: string): string {
   return `email:throttle:${senderId}`;
 }
 
+export function lastSendKeyFor(senderId: string): string {
+  return `email:lastsend:${senderId}`;
+}
+
 export function rateKeyFor(senderId: string, bucket: string): string {
   return `email:rate:${senderId}:${bucket}`;
 }
@@ -134,4 +138,50 @@ export async function reserveSendSlot(senderId: string, opts: ReserveSlotOptions
     return { allowed: true, sendAtMs: Number(raw[2]) };
   }
   return { allowed: false, reason: 'RATE_LIMIT', retryAtMs: Number(raw[2]) };
+}
+
+/**
+ * Atomic pre-send spacing gate. The reservation watermark can be bypassed by
+ * concurrent matured-slot honors (several replacement jobs firing late at
+ * once all observe matured slots and send within milliseconds of each other).
+ * This Lua makes the actual send decision atomic: of N concurrent contenders,
+ * exactly one is admitted per MIN_SEND_DELAY_MS window; the rest re-bid for a
+ * near-future slot. It also bumps the throttle so future reservations stay
+ * consistent. Never starves: any contender arriving D after the last send is
+ * admitted.
+ */
+const CLAIM_SEND_SCRIPT = `
+local nowMs = tonumber(ARGV[1])
+local minDelayMs = tonumber(ARGV[2])
+local ttlSec = tonumber(ARGV[3])
+local last = tonumber(redis.call('GET', KEYS[1]) or '0')
+if nowMs - last < minDelayMs then
+  return {0, minDelayMs - (nowMs - last)}
+end
+redis.call('SET', KEYS[1], nowMs, 'EX', ttlSec)
+local t = tonumber(redis.call('GET', KEYS[2]) or '0')
+local bumped = math.max(t, nowMs + minDelayMs)
+redis.call('SET', KEYS[2], bumped, 'EX', ttlSec)
+return {1, 0}
+`;
+
+export interface SendGateResult {
+  allowed: boolean;
+  retryInMs: number;
+}
+
+export async function claimSendSlot(senderId: string, opts?: { minDelayMs?: number; nowMs?: number }): Promise<SendGateResult> {
+  const minDelayMs = opts?.minDelayMs ?? env.MIN_SEND_DELAY_MS;
+  const nowMs = opts?.nowMs ?? Date.now();
+  const ttlSec = Math.ceil(minDelayMs / 1000) + 300;
+  const raw = (await getClient().eval(
+    CLAIM_SEND_SCRIPT,
+    2,
+    lastSendKeyFor(senderId),
+    throttleKeyFor(senderId),
+    String(nowMs),
+    String(minDelayMs),
+    String(ttlSec),
+  )) as [number, number];
+  return raw[0] === 1 ? { allowed: true, retryInMs: 0 } : { allowed: false, retryInMs: Number(raw[1]) };
 }

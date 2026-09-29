@@ -48,6 +48,7 @@ function immediateDeps(fn: EmailSender) {
     reserve: async () => ({ allowed: true as const, sendAtMs: Date.now() }),
     onRateLimit: async () => undefined,
     indexEmail: async () => undefined,
+    gate: async () => ({ allowed: true as const, retryInMs: 0 }),
   };
 }
 

@@ -5,6 +5,7 @@ import { getDbPool } from '../lib/db.js';
 import { prisma } from '../lib/prisma.js';
 import { closeEmailQueue, getEmailQueue } from '../queues/email.queue.js';
 import {
+  claimSendSlot,
   closeReservationClient,
   nextHourBoundaryMs,
   rateKeyFor,
@@ -38,6 +39,7 @@ const noopDeps = {
   sender: async () => ({ messageId: 'x', previewUrl: null }),
   onRateLimit: async () => undefined,
   indexEmail: async () => undefined,
+  gate: async () => ({ allowed: true as const, retryInMs: 0 }),
 };
 
 beforeAll(async () => {
@@ -268,6 +270,98 @@ describe('worker: rescheduling', () => {
     expect(second).toBe('sent');
     expect(calls).toBe(1);
     expect((await prisma.scheduledEmail.findUnique({ where: { id: row.id } }))?.status).toBe('SENT');
+  });
+});
+
+describe('send gate: atomic spacing', () => {
+  async function createGateRow() {
+    const campaign = await prisma.emailCampaign.create({
+      data: {
+        userId: identity.userId,
+        senderId: identity.senderId,
+        subject: 'Gate test',
+        body: 'Hello',
+        startTime: new Date(),
+        delayMs: 0,
+        hourlyLimit: 100,
+      },
+    });
+    return prisma.scheduledEmail.create({
+      data: {
+        campaignId: campaign.id,
+        userId: identity.userId,
+        senderId: identity.senderId,
+        recipient: `gate-${Math.random().toString(36).slice(2)}@example.com`,
+        subject: 'Gate test',
+        body: 'Hello',
+        scheduledAt: new Date(),
+      },
+    });
+  }
+
+  it('admits exactly one of many concurrent contenders', async () => {
+    const sid = senderKey(20);
+    const t0 = Date.now();
+    const results = await Promise.all(
+      Array.from({ length: 8 }, () => claimSendSlot(sid, { minDelayMs: 5000, nowMs: t0 })),
+    );
+    expect(results.filter((r) => r.allowed)).toHaveLength(1);
+    expect(results.filter((r) => !r.allowed)).toHaveLength(7);
+  });
+
+  it('denies within the window with retryIn, admits after it (deterministic clock)', async () => {
+    const sid = senderKey(21);
+    const t0 = 1_700_000_000_000;
+    expect(await claimSendSlot(sid, { minDelayMs: 2000, nowMs: t0 })).toEqual({ allowed: true, retryInMs: 0 });
+    const denied = await claimSendSlot(sid, { minDelayMs: 2000, nowMs: t0 + 500 });
+    expect(denied.allowed).toBe(false);
+    if (!denied.allowed) expect(denied.retryInMs).toBe(1500);
+    expect(await claimSendSlot(sid, { minDelayMs: 2000, nowMs: t0 + 2000 })).toEqual({
+      allowed: true,
+      retryInMs: 0,
+    });
+  });
+
+  it('processor reschedules (without retry) when the gate is busy', async () => {
+    const row = await createGateRow();
+    let calls = 0;
+    const outcome = await processEmailJob(stubJob(row.id), {
+      ...noopDeps,
+      sender: async () => {
+        calls += 1;
+        return { messageId: 'm', previewUrl: null };
+      },
+      // Stubbed immediate slot: this test exercises the GATE, not bidding,
+      // and must not advance the shared throttle (test isolation).
+      reserve: async () => ({ allowed: true as const, sendAtMs: Date.now() }),
+      gate: async () => ({ allowed: false as const, retryInMs: 1500 }),
+    });
+    expect(outcome).toBe('rescheduled');
+    expect(calls).toBe(0);
+    const after = await prisma.scheduledEmail.findUnique({ where: { id: row.id } });
+    expect(after?.status).toBe('SCHEDULED');
+    const job = await getEmailQueue().getJob(after!.bullmqJobId as string);
+    expect(job).toBeTruthy();
+    await job?.remove();
+  });
+
+  it('matured slot + busy gate reschedules instead of sending', async () => {
+    const row = await createGateRow();
+    let calls = 0;
+    const outcome = await processEmailJob(stubJob(row.id, 0, Date.now() - 1000, true), {
+      ...noopDeps,
+      sender: async () => {
+        calls += 1;
+        return { messageId: 'm', previewUrl: null };
+      },
+      reserve: async () => ({ allowed: true as const, sendAtMs: Date.now() }),
+      gate: async () => ({ allowed: false as const, retryInMs: 800 }),
+    });
+    expect(outcome).toBe('rescheduled');
+    expect(calls).toBe(0);
+    const after = await prisma.scheduledEmail.findUnique({ where: { id: row.id } });
+    const job = await getEmailQueue().getJob(after!.bullmqJobId as string);
+    await job?.remove();
   });
 });
 

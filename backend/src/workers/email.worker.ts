@@ -5,7 +5,7 @@ import { env } from '../config/env.js';
 import { createBullmqConnection } from '../lib/bullmq-connection.js';
 import { emailJobId, emailQueueName, getEmailQueue, type EmailJobData } from '../queues/email.queue.js';
 import { sendEmail, type SendEmailInput, type SendEmailResult } from '../services/email.service.js';
-import { reserveSendSlot } from '../services/send-reservation.service.js';
+import { reserveSendSlot, claimSendSlot, type SendGateResult } from '../services/send-reservation.service.js';
 import { notifyRateLimitHit } from '../services/slack.service.js';
 import { indexEmailByIdSafe } from '../services/email-search.service.js';
 
@@ -28,6 +28,7 @@ export interface ProcessDeps {
   reserve?: (senderId: string, hourlyLimit: number) => Promise<{ allowed: true; sendAtMs: number } | { allowed: false; reason: 'RATE_LIMIT'; retryAtMs: number }>;
   onRateLimit?: (info: RateLimitInfo) => Promise<void>;
   indexEmail?: (emailId: string) => Promise<void>;
+  gate?: (senderId: string) => Promise<SendGateResult>;
 }
 
 const defaultDeps: Required<ProcessDeps> = {
@@ -35,6 +36,7 @@ const defaultDeps: Required<ProcessDeps> = {
   reserve: (senderId, hourlyLimit) => reserveSendSlot(senderId, { hourlyLimit }),
   onRateLimit: (info) => notifyRateLimitHit(info),
   indexEmail: (emailId) => indexEmailByIdSafe(emailId),
+  gate: (senderId) => claimSendSlot(senderId, {}),
 };
 
 /**
@@ -54,6 +56,18 @@ export const RECOVERY_GRACE_MS = 2 * 60 * 1000;
  * so bursts serialize. Firing jitter is seconds; anything later re-bids.
  */
 export const SLOT_GRACE_MS = 30_000;
+
+/**
+ * Tolerance when deciding whether a reserved slot is "now". The reservation
+ * returns sendAt == its own request time for immediate slots, but by the time
+ * the worker compares it, the clock has advanced past it — without tolerance,
+ * every immediate slot looks (marginally) future and nothing ever sends.
+ * Kept far below any realistic minimum delay (and tests use 300ms): genuine
+ * future slots still reschedule. Actual inter-send spacing is enforced
+ * atomically by the send gate, so this only absorbs scheduling/event-loop
+ * jitter of a few milliseconds.
+ */
+export const SLOT_NOW_EPSILON_MS = 100;
 
 function sanitizeErrorMessage(err: unknown): string {
   const raw = err instanceof Error ? `${err.name}: ${err.message}` : String(err);
@@ -117,10 +131,13 @@ async function rescheduleToSlot(emailId: string, senderId: string, sendAtMs: num
  *   limit, one atomic Lua script). If the slot is in the future → reschedule
  *   (delayed replacement job, no retry consumed). If the hour is full →
  *   reschedule at the next hour boundary + best-effort Slack alert.
+ * - Send candidates pass an atomic spacing gate (second Lua script) so
+ *   concurrent executions can't start SMTP closer together than the minimum
+ *   delay; denied candidates reschedule briefly without consuming a retry.
  * - Otherwise send via SMTP → SENT (+ES index), or retry/FAILED as Phase 4.
  */
 export async function processEmailJob(job: ProcessableEmailJob, deps: ProcessDeps = {}): Promise<ProcessOutcome> {
-  const { sender, reserve, onRateLimit, indexEmail } = { ...defaultDeps, ...deps };
+  const { sender, reserve, onRateLimit, indexEmail, gate } = { ...defaultDeps, ...deps };
   // Structural guarantee: indexing can never break sending, no matter what
   // indexEmail implementation is injected.
   const safeIndex = async (id: string): Promise<void> => {
@@ -208,7 +225,7 @@ export async function processEmailJob(job: ProcessableEmailJob, deps: ProcessDep
     job.data.slotMs != null &&
     nowMs >= job.data.slotMs &&
     nowMs - job.data.slotMs <= SLOT_GRACE_MS;
-  if (!slotMatured && reservation.sendAtMs > nowMs) {
+  if (!slotMatured && reservation.sendAtMs > nowMs + SLOT_NOW_EPSILON_MS) {
     logger.info(
       { emailId, senderId: email.sender.id, sendAt: new Date(reservation.sendAtMs).toISOString() },
       'minimum send delay not yet satisfied; rescheduling',
@@ -218,7 +235,19 @@ export async function processEmailJob(job: ProcessableEmailJob, deps: ProcessDep
     return 'rescheduled';
   }
   if (slotMatured) {
-    logger.info({ emailId, slot: new Date(job.data.slotMs as number).toISOString() }, 'slot matured; sending');
+    logger.info({ emailId, slot: new Date(job.data.slotMs as number).toISOString() }, 'slot matured; trying send gate');
+  }
+
+  // Atomic spacing gate: serializes concurrent send candidates (matured
+  // honors and fresh bids alike) so actual SMTP starts stay >= min-delay
+  // apart even under worker saturation. Denied candidates reschedule briefly
+  // without consuming a BullMQ retry; the gate always admits once D elapsed.
+  const gateResult = await gate(email.sender.id);
+  if (!gateResult.allowed) {
+    logger.info({ emailId, senderId: email.sender.id, retryInMs: gateResult.retryInMs }, 'send gate busy; rescheduling');
+    await rescheduleToSlot(emailId, email.sender.id, Date.now() + gateResult.retryInMs);
+    await safeIndex(emailId);
+    return 'rescheduled';
   }
 
   try {
